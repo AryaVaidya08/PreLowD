@@ -452,7 +452,7 @@ def train_and_save_result(
 
 
 def main():
-    main_args, default_config = parse_args(base_config_path='./configs_FFNO/_base.yaml')
+    main_args, default_config = parse_args(base_config_path='PreLowD/configs_FFNO/_base.yaml')
 
     # Creating a folder for the results
     result_dir = './results/' + main_args.name
