@@ -5,6 +5,7 @@ import pickle
 from collections import OrderedDict
 from copy import deepcopy
 from tqdm import tqdm
+import torch.nn as nn
 import pandas as pd
 import torch
 from torch import optim
@@ -12,13 +13,12 @@ from torch import optim
 from config_parser import parse_args, save_config
 from Datasets import PDEDataset
 from utils_train import set_seed, parse_csv, Relative_Lp_Loss, train_iters
-from Models import FFNO
+from Models import FFNO, Projector, Linear, FeedForward, Factorized_Spectral_Layer
 from plotting import plot_experiments, plot_training, model_namer, transfer_namer
 
 
 os.makedirs('./results', exist_ok=True)
 Device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
 
 def is_result_or_seed_col(col_name): # YOU CAN CUSTOMIZE THIS
     """
@@ -350,19 +350,22 @@ def train_and_save_result(
         device = Device
         )
 
+    print(pretrained_ffno_path)
+
     ffno, training_result = train_ffno(
         ffno, 
         args, 
         data_train,
         data_val,
         *get_data_config_functions(args, val_separate),
-        pretrained_ffno = torch.load(pretrained_ffno_path, map_location=Device) if pretrained_ffno_path else None    
+        pretrained_ffno = torch.load(pretrained_ffno_path, weights_only=True, map_location=Device) if pretrained_ffno_path else None    
     )
 
     # saving result:
     vars(args)['batch_train_time'] = training_result['batch_train_time']
     
     y_vars = []
+    print(f"\"{args.val_rollouts}\"")
     for r in parse_csv(args.val_rollouts, full=[1], func=int):
 
         vars(args)[f'batch_val_time_r{r}'] = training_result['batch_val_time'][f'r{r}']
@@ -453,7 +456,9 @@ def train_and_save_result(
 
 def main():
     main_args, default_config = parse_args(base_config_path='PreLowD/configs_FFNO/_base.yaml')
-
+    print(main_args.model_configs)
+    torch.serialization.add_safe_globals([torch.nn.modules.activation.ReLU, torch.nn.modules.container.Sequential, torch.nn.modules.container.ParameterList, FeedForward, Factorized_Spectral_Layer, torch.nn.modules.container.ModuleList, FFNO, Projector, Linear, torch.nn.modules.container.ModuleDict])
+    torch.serialization._include_weights_only_default = False
     # Creating a folder for the results
     result_dir = './results/' + main_args.name
 
