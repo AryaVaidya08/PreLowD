@@ -10,9 +10,9 @@ os.makedirs('experiments_FFNO/MAIL25', exist_ok=True)
 
 bash_init = '#!/bin/bash\n'
 
-train_command = 'python Train_FFNO.py'
+train_command = 'python PreLowD/Train_FFNO.py'
 
-data_dir = '/home/pouya/FPNO_data'
+data_dir = '/content/FFNO/diffusion/'
 
 # templates ############################################################################################################
 
@@ -41,17 +41,17 @@ def make_cmd_2d_adv(beta, gpu_index, seed):
 def make_cmd_1d_diff(nu, gpu_index):
     cmd = f'CUDA_VISIBLE_DEVICES={gpu_index} {train_command}'
     cmd += f' --name 1D_Diffusion_Nu{nu}'
-    cmd += f' --data_dir {data_dir}'
+    cmd += f' --data_dir {data_dir}/1d'
     cmd += f' --data_train 1D_Diffusion_Nu{nu}.hdf5'
     cmd += f' --data_ndims 1'
-    cmd += f' --model_configs ./configs_FFNO/pretrain.yaml'
+    cmd += f' --model_configs ./configs_FFNO/pretrain_test.yaml'
     cmd += '\n'
     return cmd
 
 def make_cmd_2d_diff(nu, gpu_index, seed):
     cmd = f'CUDA_VISIBLE_DEVICES={gpu_index} {train_command}'
     cmd += f' --name 2D_Diffusion_Nu{nu}_seed{seed}'
-    cmd += f' --data_dir {data_dir}'
+    cmd += f' --data_dir {data_dir}/2d'
     cmd += f' --data_train 2D_Diffusion_Nu{nu}.hdf5'
     cmd += f' --data_ndims 2'
     cmd += f' --model_configs ./configs_FFNO/downstream_seed{seed}.yaml'
@@ -114,16 +114,16 @@ for i, gpu_index in enumerate([0]):
     with open(f'experiments_FFNO/{pc}/run_1D_Adv_{beta}_Diff_{nu}.sh', 'w') as file:
         file.write(cmd)
 
-# 2D_Adv_Beta1.0 on GPUs 0, 1, 2:
-for i, gpu_index in enumerate([0, 1, 2]):
+# 2D_Adv_Beta1.0 on GPUs 0, 1, 2: --> changed to 0
+for i, gpu_index in enumerate([0]):
     beta = 1.0
     cmd = bash_init
     cmd += make_cmd_2d_adv(beta, gpu_index, i)
     with open(f'experiments_FFNO/{pc}/run_gpu{gpu_index}.sh', 'w') as file:
         file.write(cmd)
 
-# 2D_Diff_Nu0.004 on GPUs 3, 4, 5:
-for i, gpu_index in enumerate([3, 4, 5]):
+# 2D_Diff_Nu0.004 on GPUs 3, 4, 5: --> changed to 0
+for i, gpu_index in enumerate([0]):
     nu = 0.004
     cmd = bash_init
     cmd += make_cmd_2d_diff(0.004, gpu_index, i)
@@ -146,8 +146,8 @@ for i, gpu_index in enumerate([0]):
     with open(f'experiments_FFNO/{pc}/run_1D_Diff_{nu}.sh', 'w') as file:
         file.write(cmd)
 
-# 2D_Diff_Nu0.001 on GPUs 0, 1, 2:
-for i, gpu_index in enumerate([0, 1, 2]):
+# 2D_Diff_Nu0.001 on GPUs 0, 1, 2: --> changed to 0
+for i, gpu_index in enumerate([0]):
     nu = 0.001
     cmd = bash_init
     cmd += make_cmd_2d_diff(0.001, gpu_index, i)
@@ -170,8 +170,8 @@ for i, gpu_index in enumerate([0]):
     with open(f'experiments_FFNO/{pc}/run_1D_Diff_Nu_{0.002}.sh', 'w') as file:
         file.write(cmd)
 
-# 2D_Diff_Nu0.002 on GPUs 0, 1, 2:
-for i, gpu_index in enumerate([0, 1, 2]):
+# 2D_Diff_Nu0.002 on GPUs 0, 1, 2: --> changed to 0
+for i, gpu_index in enumerate([0]):
     nu = 0.002
     cmd = bash_init
     cmd += make_cmd_2d_diff(nu, gpu_index, i)
