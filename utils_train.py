@@ -21,6 +21,7 @@ def set_seed(seed):
 
 
 def parse_csv(s:str, full:list, func=str):
+    s = str(s)
     if not s: # if s is None or an empty string
         return []
     if 'all' in s:
