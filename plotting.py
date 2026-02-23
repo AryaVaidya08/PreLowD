@@ -106,6 +106,7 @@ def plot_experiments(
         ):
     
     if save_dir is None:
+        os.mkdir(result_dir + '/processed')
         save_dir = result_dir + '/processed'
     
     result_df = result_df.fillna('') # to count NaNs as a unique value

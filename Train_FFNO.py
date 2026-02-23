@@ -130,7 +130,7 @@ def get_data_config_functions(args, val_separate):
         
     def config_val_data_for_validation(dataset):
         dataset.config(
-            subset = 0.0 if val_separate else args.val_size,
+            subset = 1.0 if val_separate else args.val_size,
             where = args.val_mode,
             reverse = False,
             seed = args.val_seed,
