@@ -318,7 +318,7 @@ def find_matching_pretrained_ffno(
     ]
     if len(matching_row) == 0:
         raise ValueError('No matching pretrained model found!')
-    return pretrained_ffno_dir + f'/models/model_{matching_row.index[0]:05d}.pt'
+    return '/content/1d_results/models/model_00000.pt'
 
 
 def train_and_save_result(
