@@ -296,7 +296,7 @@ def find_matching_pretrained_ffno(
         pretrained_ffno_dir,
         model_args
         ):
-    pretrained_dir_result_table = pd.read_excel(pretrained_ffno_dir+'/table.xlsx')
+    pretrained_dir_result_table = pd.read_excel("/"+pretrained_ffno_dir+'/table.xlsx')
     # find a row that its columns matches the content of the dict of vars(model_args)
 
     matching_args = {
