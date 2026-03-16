@@ -14,14 +14,9 @@ transfer_ff_layers:
 - all
 tune_fourier_layers:
 - all
-- ''
-- 0,
-- 3,
+
 tune_ff_layers:
 - all
-- ''
-- 0,
-- 3,
 
 transfer_out_vars:
 - all
