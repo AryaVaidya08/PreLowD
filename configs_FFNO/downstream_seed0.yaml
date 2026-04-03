@@ -20,7 +20,7 @@ share_fourier:
 rollout:
 - 1
 seed:
-- 0
+- 4
 iters:
 - 5000
 batch_size:
@@ -28,17 +28,7 @@ batch_size:
 optimizer:
 - AdamW
 frac_train_data:
-- 0.000125
-- 0.00025
-- 0.0005
-- 0.001
-- 0.002
-- 0.004
-- 0.008
-- 0.016
-- 0.032
-- 0.064
-- 0.128
+- INSERT_NUM_HERE
 
 # validation:
 val_iters:
