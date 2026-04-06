@@ -1,0 +1,257 @@
+# THIS IS THE MAIN CONFIG FILE USED TO GENERATE THE ARGUMENT PARSER FOR Train_FFNO_PDE.py
+
+# DO NOT CHANGE OR MODIFY THIS FILE
+
+# DATA LOCATION AND LOADING SETTINGS ############################################
+
+data_dir:
+  type: str
+  help: Path to the data directory
+  default: /media/pouya/DATA1/PDE_data/FPNO_data
+
+data_ndims:
+  type: int
+  help: Number of spatial dimensions
+  default: 1
+
+data_train:
+  type: str
+  help: Path to the train data file relative to data_dir
+  default: null
+
+data_train_t_start:
+  type: int
+  help: starting time index when loading the train data (inclusive)
+  default: null
+
+data_train_t_end:
+  type: int
+  help: ending time index when loading the train data (exclusive)
+  default: null
+
+data_train_dt:
+  type: int
+  help: loading dt of the train data
+  default: null
+
+data_train_rx:
+  type: int
+  help: loading spatial resolution of the train data
+  default: null
+
+data_val:
+  type: str
+  help: Path to the validation data file relative to data_dir. If null, part of the training data is used for validation
+  default: null
+
+data_val_t_start:
+  type: int
+  help: starting time index when loading the validation data
+  default: null
+
+data_val_t_end:
+  type: int
+  help: ending time index when loading the validation data
+  default: null
+
+data_val_dt:
+  type: int
+  help: loading dt of the validation data
+  default: null
+
+data_val_rx:
+  type: int
+  help: loading spatial resolution of the validation data
+  default: null
+
+val_size:
+  type : float
+  help: Fraction of the training data used for validation
+  default: 0.2
+
+val_mode:
+  type: str
+  help: Mode of validation data selection from the whole dataset
+  choices: [random, top, bottom, middle]
+  default: random
+
+val_seed:
+  type : int
+  help: Torch manual seed for the random selection of the validation set
+  default: 0
+
+# model setting (FFNO_PDE) ######################################################
+
+in_snapshots:
+  type: int
+  help: Number of input snapshots
+  default: 1
+
+out_snapshots:
+  type: int
+  help: Number of output snapshots
+  default: 1
+
+dt:
+  type: int
+  help: prediction dt
+  default: 1
+
+skip:
+  type: int
+  help: Number of snapshots to skip when predicting the future
+  default: 0
+
+n_layers:
+  type : int
+  help: Number of layers of the model
+  default: 4
+
+ffno_width:
+  type: int
+  help: Width of the FFNO model
+  default: 128
+
+fourier_modes:
+  type: int
+  help: Number of the fourier modes (in all dimensions)
+  default: 16
+
+share_fourier:
+  type: int
+  help: If 1 (true), the fourier weights are shared across dimensions
+  default: 0
+
+# PDE PARAMETER CONDITIONING ####################################################
+
+pde_param_vars:
+  type: str
+  help: >
+    Comma-separated names of datasets in the h5 file to use as PDE parameters.
+    Each dataset should have shape (N,) or (N, k) where N is number of trajectories.
+    Example: 'nu' or 'nu,rho'. Takes priority over pde_param_values if both are set.
+  default: ''
+
+pde_param_values:
+  type: str
+  help: >
+    Comma-separated constant PDE parameter values applied uniformly to all trajectories.
+    Used when parameters are not stored in the h5 file.
+    Example: '0.01' or '0.001,1.0'. Ignored if pde_param_vars is set.
+  default: ''
+
+# training settings #############################################################
+
+rollout:
+  type : int
+  help: Number of rollout steps
+  default: 1
+
+seed:
+  type : int
+  help: random seed of the experiment
+  default: 0
+
+iters:
+  type : int
+  help: Number of training iterations
+  default: 5000
+
+batch_size:
+  type : int
+  help: Batch size
+  default: 64
+
+optimizer:
+  type: str
+  help: Optimizer for the training. Should be in torch.optim
+  default: AdamW
+
+frac_train_data:
+  type : float
+  help: Fraction of the training data used in training
+  default: 1.0
+
+val_iters:
+  type: str
+  help: iterations that the validation is performed
+  default: 5000,
+
+val_rollouts:
+  type: str
+  help: the rollouts that the validation is performed with
+  default: 1,5
+
+# transfer learning settings ####################################################
+
+transfer_from:
+  type: str
+  help: Path to the pre-trained model directory.
+  default: ''
+
+transfer_in_vars:
+  type: str
+  help: variables for which the input projection is transferred from the pre-trained model
+  default: ''
+
+transfer_in_vars_scalers:
+  type: str
+  help: scalers for the input projection variables (while projecting)
+  default: ''
+
+tune_in_vars:
+  type: str
+  help: variables for which the input projection is tuned
+  default: ''
+
+transfer_fourier_layers:
+  type: str
+  help: comma separated list of layer indexes for which the fourier weights are transferred
+  default: ''
+
+transfer_fourier_scalers:
+  type: str
+  help: comma separated list of scalers for the fourier weights (while projecting)
+  default: null
+
+transfer_ff_layers:
+  type: str
+  help: comma separated list of layer indexes for which the FeedForward layers are transferred
+  default: ''
+
+transfer_conditioner_layers:
+  type: str
+  help: >
+    Comma-separated layer indexes for which the PDE conditioner weights are transferred.
+    Default empty (conditioner always trained from scratch for new parameter spaces).
+  default: ''
+
+tune_fourier_layers:
+  type: str
+  help: comma separated list of layer indexes for which the fourier weights are tuned
+  default: ''
+
+tune_ff_layers:
+  type: str
+  help: comma separated list of layer indexes for which the FeedForward layers are tuned
+  default: ''
+
+tune_conditioner_layers:
+  type: str
+  help: comma separated list of layer indexes for which the PDE conditioner layers are tuned
+  default: 'all'
+
+transfer_out_vars:
+  type: str
+  help: variables for which the output projection is transferred from the pre-trained model
+  default: ''
+
+transfer_out_vars_scalers:
+  type: str
+  help: multipliers for the output projection variables (while projecting)
+  default: ''
+
+tune_out_vars:
+  type: str
+  help: variables for which the output projection is tuned
+  default: ''
