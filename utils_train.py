@@ -86,20 +86,30 @@ def forward_pass_loss(
         keep_time = False
         ):
 
+    #USED FOR PDE -------------------- CHANGE IF DNE        
+    *xs, pde_p = xs
     rollout = len(xs) - 1
 
+
+    
+
+
     if rollout == 0:
+        #print(50 * "AutoENCODING ")
         # Assuming we are AutoEncoding, since each sample has only one tensor
         x = xs[0]
         x_rec = model(x)
         final_loss = loss_fn(x_rec, x, reduction=loss_reduction)
 
     elif rollout > 0:
+        #print(50 * "ROLLOUT ")
+        # assume tensors is your List[torch.Tensor]
+        torch.save(xs, "tensors.pt")
 
         model_input = xs[0]
         losses = []
         for r in range(1, rollout+1):
-            model_output = model(model_input)
+            model_output = model(model_input, pde_params=pde_p)
             loss = loss_fn(model_output, xs[r], reduction=loss_reduction)
             losses.append(loss)
             if rollout == 1: break # to avoid unnecessary errors for simple input to output tasks
@@ -349,7 +359,7 @@ def train_iters(
         # TRAINING
         for xs in train_loader:
             start_time = time.time()
-
+            #print("WALLAHIIIIIIIIII", xs[0].keys(), "BISMA:LLALLALAL")
             some_key = list(xs[0].keys())[0]
             b = xs[0][some_key].shape[0]
             opt.zero_grad()
