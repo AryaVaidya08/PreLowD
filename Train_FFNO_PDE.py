@@ -348,6 +348,9 @@ def train_and_save_result(
         width = args.ffno_width,
         fourier_modes = args.data_ndims*[args.fourier_modes],
         share_fourier = args.share_fourier,
+
+        n_pde_params = 3,
+        param_mlp_hidden = 2 * 160,
         
         device = Device
         )
