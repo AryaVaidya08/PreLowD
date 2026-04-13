@@ -398,7 +398,7 @@ class PDEDataset(Dataset):
         # into a (B, n_params) tensor automatically.
         if self.pde_params is not None:
             pde_p = self.pde_params[self.indexes[traj_idx]]   # (n_params,)
-            return sample, pde_p
+            sample.append(pde_p)
         # ────────────────────────────────────────────────────────────────────
 
         return sample
