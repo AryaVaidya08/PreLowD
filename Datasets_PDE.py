@@ -137,7 +137,7 @@ class PDEDataset(Dataset):
             device = Device,
             load_now = True,
             verbose = False,
-            pde_params : torch.FloatTensor = None,  # (N, n_params) — one row per trajectory
+            pde_params: str | None = None,  # path, or None
             ):
         super().__init__()
 
@@ -171,13 +171,12 @@ class PDEDataset(Dataset):
 
         self.set_pde_params(pde_params)
 
-    def set_pde_params(self, pde_params: torch.FloatTensor = None):
+    def set_pde_params(self, pde_params=None):
         """
         Set or replace the PDE parameter tensor.
-
-        pde_params : (N, n_params) float tensor, one row per trajectory.
-                     Pass None to disable parameter conditioning.
-
+        pde_params : str         — path to a .pt, .npy, or .csv file
+                    torch.Tensor — (N, n_params) float tensor, one row per trajectory
+                    None         — disable parameter conditioning
         The tensor is moved to self.device and stored as self.pde_params.
         self.n_pde_params is set to the number of parameters (or 0 if None).
         """
@@ -185,6 +184,14 @@ class PDEDataset(Dataset):
             self.pde_params = None
             self.n_pde_params = 0
             return
+
+        if isinstance(pde_params, str):
+            path = pde_params
+            if path.endswith('.npy'):
+                pde_params = torch.from_numpy(np.load(path))
+            else:
+                raise ValueError(f'Unsupported file extension for pde_params: {path!r}. '
+                                'Expected .pt/.pth, .npy, or .csv')
 
         pde_params = torch.as_tensor(pde_params, dtype=torch.float32)
         assert pde_params.ndim == 2, 'pde_params must be 2D: (N, n_params)'
