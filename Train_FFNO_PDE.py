@@ -11,9 +11,9 @@ import torch
 from torch import optim
 
 from config_parser import parse_args, save_config
-from Datasets import PDEDataset
+from Datasets_PDE import PDEDataset
 from utils_train import set_seed, parse_csv, Relative_Lp_Loss, train_iters
-from Models import FFNO, Projector, Linear, FeedForward, Factorized_Spectral_Layer
+from Models_PDE import FFNO, Projector, Linear, FeedForward, Factorized_Spectral_Layer
 from plotting import plot_experiments, plot_training, model_namer, transfer_namer
 
 
