@@ -351,6 +351,9 @@ def train_and_save_result(
 
         n_pde_params = 3,
         param_mlp_hidden = 2 * 160,
+
+        use_time_mlp = True,
+        time_mlp_hidden = 2 * 160,
         
         device = Device
         )
