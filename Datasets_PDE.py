@@ -1,6 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 @author: AmirPouya Hemmasian (a.pouyahemmasian@gmail.com) (ahemmasi@andrew.cmu.edu)
+
+Modification: __getitem__ now returns pde_params and the normalised timestep t
+as two separate tensors at the end of the sample list, so each can be routed to
+its own MLP in FFNO independently.
+
+Returned list layout:
+    [ chunk_0, chunk_1, ..., chunk_rollout,   <-- field dicts as before
+      pde_params,                              <-- (n_pde_params,)  or absent
+      t ]                                      <-- scalar tensor, always present
+
+Unpack in your training loop as:
+    *chunks, pde_params, t = batch    # when pde_params is enabled
+    *chunks, t             = batch    # when pde_params is disabled (n_pde_params=0)
 """
 import numpy as np
 import h5py
@@ -11,40 +24,29 @@ Device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def extract_h5_data(
         data_path,
-        t_start = None, # start time-step (not actual starting time) (inclusive)
-        t_end = None, # end time-step (not actual starting time) (inclusive)
-        dt = 1, # time-step interval when loading
-        rx = None, # resolution for spatial dimensions
-        dx = None, # dx of downsampling if rx is not specified.
+        t_start = None,
+        t_end = None,
+        dt = 1,
+        rx = None,
+        dx = None,
         device = Device,
         load_now = False,
         verbose = False
 ):
     """
     Extracts variables and coordinates from an h5 or hdf5 file as dictionaries.
-    Since the spatial resolution might be too high, there is an option to downsample it.
-
-    Returns:
-        N : int : Number of trajectories
-        nt : int : Number of snapshots
-        Vars : OrderedDict : Dictionary of variables
-            Each item in the dictionary has {'data': Tensor, 'stat':stat_data}
-            where for each variable, we store the data as well as some statistics
-            which will be useful for normalizaitons later
-        Coords : OrderedDict : Dictionary of coordinates
-            Each item in the dictionary has {'data': , 'shape':, 'min':, 'max':}
     """
     N, nt = None, None
     Vars = {}
     Coords = {}
     
     if t_end is not None:
-        t_end = t_end + 1 # to make it inclusive
+        t_end = t_end + 1
 
-    def get_d(r, r_new = None, ds_by = None):
+    def get_d(r, r_new=None, ds_by=None):
         if r_new is not None:
-            assert r%r_new == 0, 'The resolution should be divisible by the new resolution'
-            d = r//r_new
+            assert r % r_new == 0
+            d = r // r_new
         elif ds_by is not None:
             d = ds_by
         else:
@@ -58,13 +60,6 @@ def extract_h5_data(
         if name.endswith('coordinate'):
             if name[0] == 't':
                 data = torch.as_tensor(obj[t_start:t_end:dt], dtype=torch.float32, device=device if load_now else 'cpu')
-
-                # WARNING: the following block is hardcoded for PDEBench data
-                # because for some reason, t-coordinate usually has an extra time-step at the end
-                # extra_ts = (len(data)-1)%10
-                # if extra_ts > 0:
-                #     data = data[:-extra_ts]
-
             elif name[0] in ['x', 'y', 'z']:
                 d = get_d(obj.shape[0], rx, dx)
                 data = torch.as_tensor(obj[::d], dtype=torch.float32, device=device if load_now else 'cpu')
@@ -73,19 +68,17 @@ def extract_h5_data(
                 'shape': tuple(data.shape),
                 'min': data.min().item(),
                 'max': data.max().item(),
-                }
+            }
         else:
-            slicer = [slice(None)] + [ 
-                slice(t_start, t_end, dt) # time slices
-                ] + [
-                slice(None, None, get_d(r, rx, dx)) # space slices
-                 for r in obj.shape[2:]
+            slicer = [slice(None)] + [
+                slice(t_start, t_end, dt)
+            ] + [
+                slice(None, None, get_d(r, rx, dx))
+                for r in obj.shape[2:]
             ]
             if name == 'tensor':
                 name = 'u'
-            # data = torch.as_tensor(obj[*slicer], dtype=torch.float32, device=device if load_now else 'cpu')
-            # The above line needs python >=3.11 but the line below is the equivalent for older version
-            data = torch.as_tensor(obj[eval(', '.join([str(slc) for slc in slicer]))], 
+            data = torch.as_tensor(obj[eval(', '.join([str(slc) for slc in slicer]))],
                                    dtype=torch.float32, device=device if load_now else 'cpu')
             Vars[name] = {
                 'data': data,
@@ -96,30 +89,23 @@ def extract_h5_data(
                 'std': data.std().item(),
                 'meanabs': data.abs().mean().item(),
                 'maxabs': data.abs().max().item(),
-                'RMS': ((data**2).mean()**0.5).item()
-                }
-
+                'RMS': ((data ** 2).mean() ** 0.5).item()
+            }
             N = N or data.shape[0]
             assert N == data.shape[0]
             nt = nt or data.shape[1]
             assert nt == data.shape[1]
-    
+
     if verbose:
-        print(50*'-')
+        print(50 * '-')
         for coord, info in Coords.items():
-            print(
-                coord, 
-                '| shape', info['shape'],
-                *[f'| {key} {val:.6f}' for key, val in info.items() if key not in ['data', 'shape']]
-                )
-            print(50*'-')
+            print(coord, '| shape', info['shape'],
+                  *[f'| {key} {val:.6f}' for key, val in info.items() if key not in ['data', 'shape']])
+            print(50 * '-')
         for var, info in Vars.items():
-            print(
-                var,
-                '| shape', info['shape'],
-                *[f'| {key} {val:.6f}' for key, val in info.items() if key not in ['data', 'shape']]
-                )
-            print(50*'-')
+            print(var, '| shape', info['shape'],
+                  *[f'| {key} {val:.6f}' for key, val in info.items() if key not in ['data', 'shape']])
+            print(50 * '-')
 
     f.close()
     return N, nt, Vars, Coords
@@ -128,37 +114,37 @@ def extract_h5_data(
 class PDEDataset(Dataset):
     def __init__(
             self,
-            data_path : str,
-            t_start : int = None,
-            t_end : int = None,
-            dt : int = None,
-            rx : int = None,
-            dx : int = None,
-            device = Device,
-            load_now = True,
-            verbose = False,
-            pde_params: str | None = None,  # path, or None
-            ):
+            data_path: str,
+            t_start: int = None,
+            t_end: int = None,
+            dt: int = None,
+            rx: int = None,
+            dx: int = None,
+            device=Device,
+            load_now=True,
+            verbose=False,
+            pde_params: str | None = None,
+    ):
         super().__init__()
 
         if verbose:
             print('Loading', data_path, '...')
 
         self.N, self.nt, self.Vars, self.Coords = extract_h5_data(
-            data_path = data_path,
-            t_start = t_start,
-            t_end = t_end,
-            dt = dt,
-            rx = rx,
-            dx = dx,
-            device = device,
-            load_now = load_now,
-            verbose = verbose
-            )
-        
+            data_path=data_path,
+            t_start=t_start,
+            t_end=t_end,
+            dt=dt,
+            rx=rx,
+            dx=dx,
+            device=device,
+            load_now=load_now,
+            verbose=verbose
+        )
+
         if verbose:
             print('LOADED!')
-            print(50*'=')
+            print(50 * '=')
 
         self.device = device
         self.norm_mode = 'none'
@@ -174,11 +160,15 @@ class PDEDataset(Dataset):
     def set_pde_params(self, pde_params=None):
         """
         Set or replace the PDE parameter tensor.
-        pde_params : str         — path to a .pt, .npy, or .csv file
-                    torch.Tensor — (N, n_params) float tensor, one row per trajectory
-                    None         — disable parameter conditioning
-        The tensor is moved to self.device and stored as self.pde_params.
-        self.n_pde_params is set to the number of parameters (or 0 if None).
+
+        pde_params : str          — path to a .npy file
+                     torch.Tensor — (N, n_params) float tensor
+                     None         — no PDE parameter conditioning
+
+        Note: the timestep is always returned separately by __getitem__
+        regardless of this setting. n_pde_params reflects only the physics
+        parameters; use n_pde_params=0 and use_time_mlp=True in FFNO if you
+        only want temporal conditioning.
         """
         if pde_params is None:
             self.pde_params = None
@@ -190,8 +180,7 @@ class PDEDataset(Dataset):
             if path.endswith('.npy'):
                 pde_params = torch.from_numpy(np.load(path))
             else:
-                raise ValueError(f'Unsupported file extension for pde_params: {path!r}. '
-                                'Expected .pt/.pth, .npy, or .csv')
+                raise ValueError(f'Unsupported file extension: {path!r}. Expected .npy')
 
         pde_params = torch.as_tensor(pde_params, dtype=torch.float32)
         assert pde_params.ndim == 2, 'pde_params must be 2D: (N, n_params)'
@@ -201,26 +190,19 @@ class PDEDataset(Dataset):
         self.pde_params = pde_params.to(self.device)
         self.n_pde_params = pde_params.shape[1]
 
-    def normalize_manually(self, norm_cs:dict):
-        """
-        Normalize the data manually using the provided constant for each variable
-        """
+    def normalize_manually(self, norm_cs: dict):
         if self.norm_mode != 'none':
             self.normalize('none')
-                
         for var in self.Vars:
             self.Vars[var]['data'] /= norm_cs[var]
-
         self.norm_mode = 'manual'
         self.manual_norm_cs = norm_cs
 
-    def normalize(self, mode:str='none'):
+    def normalize(self, mode: str = 'none'):
         if mode == self.norm_mode:
-            # The data is already normalized in the desired way
             return
-        
+
         if mode == 'none':
-            # Reversing whatever normalization is in effect
             if self.norm_mode == 'standard':
                 for var in self.Vars.keys():
                     self.Vars[var]['data'] *= self.Vars[var]['std']
@@ -246,9 +228,8 @@ class PDEDataset(Dataset):
             return
 
         if self.norm_mode != 'none':
-            # Reversing the current normalization
-            self.norlamize('none')
-        
+            self.normalize('none')
+
         if mode == 'standard':
             for var in self.Vars.keys():
                 self.Vars[var]['data'] -= self.Vars[var]['mean']
@@ -275,80 +256,65 @@ class PDEDataset(Dataset):
             self,
             subset: float = 1.0,
             where: str = 'random',
-            reverse : bool = False, 
-            seed : int = 0,
-            frac : float = 1.0,
-            frac_seed : int = 0
-            ):
-
+            reverse: bool = False,
+            seed: int = 0,
+            frac: float = 1.0,
+            frac_seed: int = 0
+    ):
         chosen = np.full(self.N, True)
-        
-        assert subset >= 0.0
-        assert subset <= 1.0
 
+        assert 0.0 <= subset <= 1.0
         assert where in ['random', 'top', 'bottom', 'middle']
-        n_subset = round(subset*self.N)
+        n_subset = round(subset * self.N)
 
         if where == 'random':
             np.random.seed(seed)
-            cut = np.random.permutation(self.N) <= n_subset-1
-        
+            cut = np.random.permutation(self.N) <= n_subset - 1
         elif where == 'top':
             cut = np.arange(self.N) > (self.N - n_subset)
-
         elif where == 'bottom':
             cut = np.arange(self.N) <= n_subset
-        
         elif where == 'middle':
-            cut = np.arange(self.N) > (self.N//2 - n_subset//2) & np.arange(self.N) <= (self.N//2 + n_subset//2)
+            cut = np.arange(self.N) > (self.N // 2 - n_subset // 2) & np.arange(self.N) <= (self.N // 2 + n_subset // 2)
 
         if reverse:
             cut = ~cut
-        
-        chosen = chosen & cut
 
+        chosen = chosen & cut
         chosen_indexes = np.arange(self.N)[chosen]
 
         if frac == 1.0:
             self.indexes = chosen_indexes
             return self.indexes
-    
+
         np.random.seed(frac_seed)
         perm = np.random.permutation(len(chosen_indexes))
-        self.indexes = chosen_indexes[perm[:round(frac*len(chosen_indexes))]]
-
+        self.indexes = chosen_indexes[perm[:round(frac * len(chosen_indexes))]]
         return self.indexes
 
-    
-    def save(self, path:str):
+    def save(self, path: str):
         with h5py.File(path, 'w') as f:
             for attr in self.Vars.keys():
-                f.create_dataset(
-                    name = attr, 
-                    data = self.Vars[attr]['data'].cpu().numpy()
-                    )
+                f.create_dataset(name=attr, data=self.Vars[attr]['data'].cpu().numpy())
             for attr in self.Coords.keys():
-                f.create_dataset(
-                    name = attr, 
-                    data = self.Coords[attr]['data'].cpu().numpy()
-                    )
-    
+                f.create_dataset(name=attr, data=self.Coords[attr]['data'].cpu().numpy())
+
     def samples_per_traj(self) -> int:
-        return self.nt - (self.in_snapshots + self.rollout*(self.skip + self.out_snapshots) - 1) * self.dt
-    
+        return self.nt - (self.in_snapshots + self.rollout * (self.skip + self.out_snapshots) - 1) * self.dt
+
     def get_index(self, i):
         traj_idx = i // self.samples_per_traj()
         t_start = i % self.samples_per_traj()
         return traj_idx, t_start
-    
+
     def config_autoregression(
             self,
-            dt : int = None, 
-            in_snapshots : int = None,
-            out_snapshots : int = None, 
-            rollout : int = None,
-            skip : int = None,
-            ):
+            dt: int = None,
+            in_snapshots: int = None,
+            out_snapshots: int = None,
+            rollout: int = None,
+            skip: int = None,
+    ):
         if dt is None: dt = self.dt
         if in_snapshots is None: in_snapshots = self.in_snapshots
         if out_snapshots is None: out_snapshots = self.out_snapshots
@@ -359,9 +325,9 @@ class PDEDataset(Dataset):
         assert in_snapshots > 0
         assert out_snapshots > 0
         assert rollout >= 0
-        assert (in_snapshots + rollout*(skip+out_snapshots) - 1) * dt < self.nt, 'The selected setting exceed the length of the trajectory!'
+        assert (in_snapshots + rollout * (skip + out_snapshots) - 1) * dt < self.nt
         if skip > 0 and rollout > 1:
-            assert in_snapshots <= out_snapshots, 'if skip > 0, we need in_snapshots <= out_snapshots'
+            assert in_snapshots <= out_snapshots
 
         self.dt = dt
         self.in_snapshots = in_snapshots
@@ -370,35 +336,45 @@ class PDEDataset(Dataset):
         self.skip = skip
 
     def __len__(self):
-        return len(self.indexes)*self.samples_per_traj()
+        return len(self.indexes) * self.samples_per_traj()
 
-    def __getitem__(self, i : int) -> list:
+    def __getitem__(self, i: int) -> list:
         traj_idx, t_start = self.get_index(i)
-        sample = {var:
-            [
+
+        sample = {var: [
             self.Vars[var]['data'][
-                self.indexes[traj_idx], # index of trajectory
-                t_start : t_start + self.dt*self.in_snapshots : self.dt, # the selected snapshots of this trajectory
-                ...] # The input chunk
-                ] + [
-            self.Vars[var]['data'][
-                self.indexes[traj_idx], # index of trajectory
-                t_start + self.dt*(self.in_snapshots + (j+1)*self.skip + j*self.out_snapshots) : t_start + self.dt*(self.in_snapshots + (j+1)*self.skip + (j+1)*self.out_snapshots) : self.dt,
+                self.indexes[traj_idx],
+                t_start: t_start + self.dt * self.in_snapshots: self.dt,
                 ...]
-                for j in range(self.rollout) # The output chunks
-                ]
-        for var in self.Vars
-        }
+        ] + [
+            self.Vars[var]['data'][
+                self.indexes[traj_idx],
+                t_start + self.dt * (self.in_snapshots + (j + 1) * self.skip + j * self.out_snapshots):
+                t_start + self.dt * (self.in_snapshots + (j + 1) * self.skip + (j + 1) * self.out_snapshots):
+                self.dt,
+                ...]
+            for j in range(self.rollout)
+        ] for var in self.Vars}
 
-        sample = [{var: sample[var][j].to(self.device) for var in self.Vars} for j in range(self.rollout+1)]
+        sample = [{var: sample[var][j].to(self.device) for var in self.Vars} for j in range(self.rollout + 1)]
 
-        # ── PDE parameters ───────────────────────────────────────────────────
-        # If pde_params is set, append the parameter row for this trajectory
-        # as the last element of the returned list so the collate fn stacks it
-        # into a (B, n_params) tensor automatically.
+        # ── PDE parameters (optional, physics constants, fixed per trajectory) ─
         if self.pde_params is not None:
-            pde_p = self.pde_params[self.indexes[traj_idx]]   # (n_params,)
-            sample.append(pde_p)
+            sample.append(self.pde_params[self.indexes[traj_idx]])   # (n_pde_params,)
+
+        # ── Normalised timestep (always appended last) ───────────────────────
+        # Normalised to [0, 1] so TimeMLP sees a consistent input range.
+        # Returned as a scalar (shape []) so the DataLoader collates it to (B,).
+        t_norm = torch.tensor(
+            t_start / max(self.nt - 1, 1),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        sample.append(t_norm)
         # ────────────────────────────────────────────────────────────────────
 
         return sample
+        # Final layout:
+        #   chunk_0, ..., chunk_rollout  — field dicts
+        #   pde_params                   — (n_pde_params,)  [only if set]
+        #   t_norm                       — scalar in [0, 1] [always]
