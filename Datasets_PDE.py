@@ -1,380 +1,581 @@
-# -*- coding: utf-8 -*-
 """
-@author: AmirPouya Hemmasian (a.pouyahemmasian@gmail.com) (ahemmasi@andrew.cmu.edu)
+Author: AmirPouya Hemmasian (a.pouyahemmasian@gmail.com) (ahemmasi@andrew.cmu.edu)
 
-Modification: __getitem__ now returns pde_params and the normalised timestep t
-as two separate tensors at the end of the sample list, so each can be routed to
-its own MLP in FFNO independently.
-
-Returned list layout:
-    [ chunk_0, chunk_1, ..., chunk_rollout,   <-- field dicts as before
-      pde_params,                              <-- (n_pde_params,)  or absent
-      t ]                                      <-- scalar tensor, always present
-
-Unpack in your training loop as:
-    *chunks, pde_params, t = batch    # when pde_params is enabled
-    *chunks, t             = batch    # when pde_params is disabled (n_pde_params=0)
+Modification: PDE parameter conditioning and timestep conditioning are handled
+by two separate MLPs (ParamMLP and TimeMLP) so that each can be independently
+frozen or fine-tuned during transfer learning.
 """
-import numpy as np
-import h5py
+from einops import rearrange
 import torch
-from torch.utils.data import Dataset
+from torch import nn
+from utils_train import parse_csv, parse_csv_scalers
 
 Device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def extract_h5_data(
-        data_path,
-        t_start = None,
-        t_end = None,
-        dt = 1,
-        rx = None,
-        dx = None,
-        device = Device,
-        load_now = False,
-        verbose = False
-):
+class Linear(nn.Linear):
     """
-    Extracts variables and coordinates from an h5 or hdf5 file as dictionaries.
+    Point-Wise Linear Layer for PDE data 
+    where the feature/channel dimension is the second dimension (after batch)
     """
-    N, nt = None, None
-    Vars = {}
-    Coords = {}
-    
-    if t_end is not None:
-        t_end = t_end + 1
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    def get_d(r, r_new=None, ds_by=None):
-        if r_new is not None:
-            assert r % r_new == 0
-            d = r // r_new
-        elif ds_by is not None:
-            d = ds_by
-        else:
-            d = 1
-        return d
-
-    f = h5py.File(data_path, 'r')
-    for name, obj in f.items():
-        if not isinstance(obj, h5py.Dataset):
-            continue
-        if name.endswith('coordinate'):
-            if name[0] == 't':
-                data = torch.as_tensor(obj[t_start:t_end:dt], dtype=torch.float32, device=device if load_now else 'cpu')
-            elif name[0] in ['x', 'y', 'z']:
-                d = get_d(obj.shape[0], rx, dx)
-                data = torch.as_tensor(obj[::d], dtype=torch.float32, device=device if load_now else 'cpu')
-            Coords[name] = {
-                'data': data,
-                'shape': tuple(data.shape),
-                'min': data.min().item(),
-                'max': data.max().item(),
-            }
-        else:
-            slicer = [slice(None)] + [
-                slice(t_start, t_end, dt)
-            ] + [
-                slice(None, None, get_d(r, rx, dx))
-                for r in obj.shape[2:]
-            ]
-            if name == 'tensor':
-                name = 'u'
-            data = torch.as_tensor(obj[eval(', '.join([str(slc) for slc in slicer]))],
-                                   dtype=torch.float32, device=device if load_now else 'cpu')
-            Vars[name] = {
-                'data': data,
-                'shape': tuple(data.shape),
-                'min': data.min().item(),
-                'max': data.max().item(),
-                'mean': data.mean().item(),
-                'std': data.std().item(),
-                'meanabs': data.abs().mean().item(),
-                'maxabs': data.abs().max().item(),
-                'RMS': ((data ** 2).mean() ** 0.5).item()
-            }
-            N = N or data.shape[0]
-            assert N == data.shape[0]
-            nt = nt or data.shape[1]
-            assert nt == data.shape[1]
-
-    if verbose:
-        print(50 * '-')
-        for coord, info in Coords.items():
-            print(coord, '| shape', info['shape'],
-                  *[f'| {key} {val:.6f}' for key, val in info.items() if key not in ['data', 'shape']])
-            print(50 * '-')
-        for var, info in Vars.items():
-            print(var, '| shape', info['shape'],
-                  *[f'| {key} {val:.6f}' for key, val in info.items() if key not in ['data', 'shape']])
-            print(50 * '-')
-
-    f.close()
-    return N, nt, Vars, Coords
+    def forward(self, x):
+        x = rearrange(x, 'b c ... -> b ... c')
+        x = super().forward(x)
+        x = rearrange(x, 'b ... c -> b c ...')
+        return x
 
 
-class PDEDataset(Dataset):
+class Projector(nn.Module):
+    """
+    A simple linear projector for input and output variables.
+
+    the input/output space is a dictionary of input/output variables, each with shape (B, C, ...) where ... are spatial dimensions
+    the projection space is a single tensor of shape (B, C, ...) where ... are spatial dimensions
+    """
     def __init__(
             self,
-            data_path: str,
-            t_start: int = None,
-            t_end: int = None,
-            dt: int = None,
-            rx: int = None,
-            dx: int = None,
-            device=Device,
-            load_now=True,
-            verbose=False,
-            pde_params: str | None = None,
+            in_vars,
+            in_dim : int,
+            out_dim : int,
+            proj_dim : int,
+            out_vars = None,
+            device = Device,
     ):
+        self.device = device
+        super().__init__()
+        self.in_vars = list(in_vars)
+        self.out_vars = list(out_vars) or self.in_vars
+        self.in_projector = nn.ModuleDict({
+            var: Linear(in_dim, proj_dim, device=device)
+            for var in self.in_vars
+        })
+        self.out_projector = nn.ModuleDict({
+            var: Linear(proj_dim, out_dim, device=device)
+            for var in self.out_vars
+        })
+
+    def in_proj(self, x: dict) -> torch.FloatTensor:
+        return torch.stack([self.in_projector[var](x[var]) for var in x]).sum(dim=0)
+
+    def out_proj(self, x: torch.FloatTensor) -> dict:
+        return {var: self.out_projector[var](x) for var in self.out_vars}
+    
+    def transfer_from(
+            self,
+            source_projector : nn.Module,
+            transfer_in_vars : str = 'all',
+            transfer_in_vars_scalers : str = None,
+            transfer_out_vars : str = 'all',
+            transfer_out_vars_scalers : str = None
+            ):
+        transfer_parser = lambda x: list(x.split('>')) if '>' in x else x
+
+        in_vars = parse_csv(transfer_in_vars, full=self.in_vars, func=transfer_parser)
+        in_vars_scalers = parse_csv_scalers(transfer_in_vars_scalers)
+        
+        if len(in_vars_scalers) == 1:
+            in_vars_scalers = in_vars_scalers * len(in_vars)
+        elif len(in_vars_scalers) != len(in_vars):
+            raise ValueError('number of scalers should be the same as number of variables')
+
+        out_vars = parse_csv(transfer_out_vars, full=self.out_vars, func=transfer_parser)
+        out_vars_scalers = parse_csv_scalers(transfer_out_vars_scalers)
+        
+        if len(out_vars_scalers) == 1:
+            out_vars_scalers = out_vars_scalers * len(out_vars)
+        elif len(out_vars_scalers) != len(out_vars):
+            raise ValueError('number of scalers should be the same as number of variables')
+
+        for i, source_target in enumerate(in_vars):
+            if not isinstance(source_target, list): source_var, target_var = source_target, source_target
+            else: source_var, target_var = source_target
+            self.in_projector[target_var].weight.data = source_projector.in_projector[source_var].weight.data * in_vars_scalers[i]
+            self.in_projector[target_var].bias.data = source_projector.in_projector[source_var].bias.data * in_vars_scalers[i]
+
+        for i, source_target in enumerate(out_vars):
+            if not isinstance(source_target, list): source_var, target_var = source_target, source_target
+            else: source_var, target_var = source_target
+            self.out_projector[target_var].weight.data = source_projector.out_projector[source_var].weight.data * out_vars_scalers[i]
+            self.out_projector[target_var].bias.data = source_projector.out_projector[source_var].bias.data * out_vars_scalers[i]
+    
+    def set_trainability(
+            self, 
+            in_vars : str = None,
+            out_vars : str = None,
+            trainable : bool = True
+            ):
+        in_vars = parse_csv(in_vars, full=self.in_vars)
+        for var in in_vars:
+            self.in_projector[var].requires_grad_(trainable)
+
+        out_vars = parse_csv(out_vars, full=self.out_vars)
+        for var in out_vars:
+            self.out_projector[var].requires_grad_(trainable)
+
+
+class FeedForward(nn.Module):
+    """
+    Base code taken from:
+    https://github.com/alasdairtran/fourierflow/blob/main/fourierflow/modules/feedforward.py
+    Excluded LayerNorm and Dropout for simplicity.
+    """
+    def __init__(
+            self, 
+            dim: int, 
+            factor: int = 2, 
+            n_layers: int = 2,
+            device = Device,
+            ):
+        super().__init__()
+        self.device = device
+        self.layers = []
+        for i in range(n_layers):
+            in_dim = dim if i == 0 else dim * factor
+            out_dim = dim if i == n_layers - 1 else dim * factor
+            self.layers.extend([
+                Linear(in_dim, out_dim, device=device),
+                nn.ReLU(inplace=True)
+            ])
+        self.layers = nn.Sequential(*self.layers[:-1])
+
+    def forward(self, x):
+        return self.layers(x)
+    
+
+class ParamMLP(nn.Module):
+    """
+    Encodes PDE scalar parameters (viscosity, Re, etc.) → latent (B, width).
+
+    These are physical constants fixed per trajectory. Kept separate from
+    TimeMLP so it can be frozen/replaced independently during transfer learning.
+
+    Input:  pde_params  (B, n_params)
+    Output:             (B, width)
+    """
+    def __init__(
+            self,
+            n_params : int,
+            width    : int,
+            hidden   : int = None,
+            device = Device,
+            ):
+        super().__init__()
+        self.device = device
+        hidden = hidden or 2 * width
+        self.mlp = nn.Sequential(
+            nn.Linear(n_params, hidden, device=device),
+            nn.ReLU(),
+            nn.Linear(hidden, width, device=device),
+        )
+
+    def forward(self, pde_params: torch.FloatTensor) -> torch.FloatTensor:
+        return self.mlp(pde_params)
+
+
+class TimeMLP(nn.Module):
+    """
+    Encodes the normalised timestep t ∈ [0, 1] → latent (B, width).
+
+    Kept separate from ParamMLP because the timestep is a dynamic positional
+    signal (changes every sample) while PDE params are fixed per trajectory.
+    Separation lets you freeze this during transfer to a new PDE while only
+    retraining ParamMLP, or vice-versa.
+
+    Input:  t  (B,) or (B, 1)   normalised to [0, 1]
+    Output:    (B, width)
+    """
+    def __init__(
+            self,
+            width  : int,
+            hidden : int = None,
+            device = Device,
+            ):
+        super().__init__()
+        self.device = device
+        hidden = hidden or 2 * width
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden, device=device),
+            nn.ReLU(),
+            nn.Linear(hidden, width, device=device),
+        )
+
+    def forward(self, t: torch.FloatTensor) -> torch.FloatTensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)   # (B,) → (B, 1)
+        return self.mlp(t)
+
+
+def _broadcast_latent(latent: torch.FloatTensor, field: torch.FloatTensor) -> torch.FloatTensor:
+    """
+    Expand a (B, C) latent to match the spatial shape of `field` (B, C, *spatial).
+    """
+    n_spatial = field.ndim - 2
+    latent = latent.view(*latent.shape, *([1] * n_spatial))
+    return latent.expand_as(field)
+
+
+class Factorized_Spectral_Layer(nn.Module):
+    """
+    General Factorized Spectral Convolution Layer for 1D, 2D, or 3D spatial data.
+
+    Base code taken from:
+    https://github.com/alasdairtran/fourierflow/blob/main/fourierflow/modules/factorized_fno/mesh_2d.py
+    """
+    def __init__(
+            self, 
+            width: int,
+            fourier_modes,
+            share_fourier = False,
+            ff_factor = 2,
+            ff_n_layers = 2,
+            device = Device
+            ):
+        super().__init__()
+        self.width = width
+        self.fourier_modes = fourier_modes
+
+        self.n_spatial_dims = len(fourier_modes)
+        assert self.n_spatial_dims in [1, 2, 3], f'Only up to 3D supported. got {self.n_spatial_dims}D'
+
+        if self.n_spatial_dims == 1:
+            share_fourier = True
+        self.share_fourier = share_fourier
+
+        self.fourier_weight = nn.ParameterList()
+        for i in range(self.n_spatial_dims):
+            n_modes = fourier_modes[i]
+            weight = torch.FloatTensor(width, width, n_modes, 2)
+            weight = weight.to(device)
+            param = nn.Parameter(weight)
+            nn.init.xavier_normal_(param)
+            self.fourier_weight.append(param)
+            if share_fourier:
+                assert all([fourier_modes[0] == n_modes for n_modes in fourier_modes]), 'number of fourier modes should be the same across all axes for them to share'
+                break
+
+        self.feedforward = FeedForward(dim=width, factor=ff_factor, n_layers=ff_n_layers, device=device)
+    
+    def complex_matmul(self, input, weight, spatial_dim):
+        in_str = 'bi' + 'xyz'[:self.n_spatial_dims]
+        weight_str = 'io' + 'xyz'[spatial_dim]
+        out_str = 'bo' + 'xyz'[:self.n_spatial_dims]
+        return torch.einsum(
+            f'{in_str},{weight_str}->{out_str}',
+            input, 
+            torch.view_as_complex(weight)
+            )
+    
+    def forward_fourier_dim(self, x, dim):
+        i = dim + 2
+        n_modes = self.fourier_modes[dim]
+        shape = x.shape
+
+        ft = torch.fft.rfft(x, dim=i, norm='ortho')        
+        out_ft_shape = list(shape)
+        out_ft_shape[i] = shape[i]//2 + 1
+        out_ft = ft.new_zeros(*out_ft_shape)
+
+        slicer = [slice(None)] * len(shape)
+        slicer[i] = slice(n_modes)
+        
+        out_ft[slicer] = self.complex_matmul(
+            input = ft[slicer],
+            weight = self.fourier_weight[dim if not self.share_fourier else 0],
+            spatial_dim = dim
+            )
+        out = torch.fft.irfft(out_ft, n=shape[i], dim=i, norm='ortho')
+        return out
+    
+    def forward(self, x):
+        outs = []
+        for dim in range(self.n_spatial_dims):
+            out = self.forward_fourier_dim(x, dim)
+            outs.append(out)
+        outs = torch.stack(outs).sum(dim=0)
+        outs = self.feedforward(outs)
+        return outs
+    
+    def transfer_from(
+            self, 
+            source_layer : nn.Module,
+            fourier : bool = True,
+            scaler : float = None,
+            ff : bool = True
+            ):
+        assert source_layer.n_spatial_dims in [1, self.n_spatial_dims], 'source should be either 1D or same dims'
+        if scaler is None: scaler = 1.0
+
+        if fourier:
+            assert len(source_layer.fourier_weight) in [1, len(self.fourier_weight)], 'number of source fourier weights should be the same or 1'
+            for i in range(len(self.fourier_weight)):
+                j = 0 if len(source_layer.fourier_weight) == 1 else i
+                self.fourier_weight[i].data = source_layer.fourier_weight[j].data * scaler
+
+        if ff:
+            self.feedforward.load_state_dict(source_layer.feedforward.state_dict())
+
+    def set_trainability(
+            self, 
+            fourier : bool = True,
+            ff : bool = True,
+            trainable : bool = True
+            ):
+        if fourier:
+            self.fourier_weight.requires_grad_(trainable)
+        if ff:
+            self.feedforward.requires_grad_(trainable)
+    
+
+class FFNO(nn.Module):
+    """
+    Base code taken from:
+    https://github.com/alasdairtran/fourierflow/blob/main/fourierflow/modules/factorized_fno/mesh_2d.py
+
+    General FFNO for 1D, 2D, or 3D spatial data.
+
+    Conditioning
+    ------------
+    Two independent MLPs inject information after the first encoder layer:
+
+      ParamMLP  — physical PDE parameters (viscosity, Re, …), fixed per trajectory
+                  enable with n_pde_params > 0
+      TimeMLP   — normalised timestep t ∈ [0, 1], varies per sample
+                  enable with use_time_mlp=True  (default)
+
+    Both latents are broadcast over spatial dims and summed into the hidden state:
+
+        x += broadcast( param_mlp(pde_params) )   # if enabled
+        x += broadcast( time_mlp(t) )             # if enabled
+
+    Transfer learning
+    -----------------
+    New PDE, same time domain:
+        model.set_trainability(trainable=False, time_mlp=False, param_mlp=True)
+        # also call transfer_from(..., transfer_param_mlp=False, transfer_time_mlp=True)
+
+    Same PDE, different time window:
+        model.set_trainability(trainable=False, param_mlp=False, time_mlp=True)
+
+    Usage
+    -----
+    # Dataset produces t separately from pde_params now — see dataset_pde.py
+    *chunks, pde_params, t = batch
+    output = model(chunks[0], pde_params=pde_params, t=t)
+    """
+    def __init__(
+            self,
+            in_vars,
+            out_vars,
+            in_dim : int, 
+            out_dim : int,
+            n_layers: int,
+            width: int,
+            fourier_modes: tuple,
+            share_fourier = False,
+            ff_n_layers = 2,
+            ff_factor = 2,
+            # ── PDE parameter conditioning ───────────────────────────────────
+            n_pde_params : int = 0,         # 0 = disabled
+            param_mlp_hidden : int = None,  # hidden dim, default 2*width
+            # ── Timestep conditioning ────────────────────────────────────────
+            use_time_mlp : bool = True,     # False = disabled
+            time_mlp_hidden : int = None,   # hidden dim, default 2*width
+            # ────────────────────────────────────────────────────────────────
+            device = Device
+            ):
         super().__init__()
 
-        if verbose:
-            print('Loading', data_path, '...')
-
-        self.N, self.nt, self.Vars, self.Coords = extract_h5_data(
-            data_path=data_path,
-            t_start=t_start,
-            t_end=t_end,
-            dt=dt,
-            rx=rx,
-            dx=dx,
-            device=device,
-            load_now=load_now,
-            verbose=verbose
-        )
-
-        if verbose:
-            print('LOADED!')
-            print(50 * '=')
-
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.width = width
+        self.fourier_modes = fourier_modes
         self.device = device
-        self.norm_mode = 'none'
-        self.indexes = torch.arange(self.N)
-        self.dt = 1
-        self.in_snapshots = 1
-        self.out_snapshots = 1
-        self.rollout = 1
-        self.skip = 0
+        self.n_pde_params = n_pde_params
+        self.use_time_mlp = use_time_mlp
 
-        self.set_pde_params(pde_params)
+        self.projector = Projector(
+            in_vars = in_vars,
+            out_vars = out_vars,
+            in_dim = in_dim,
+            out_dim = out_dim,
+            proj_dim = width,
+            device = device,
+            )
+        self.n_layers = n_layers
 
-    def set_pde_params(self, pde_params=None):
-        """
-        Set or replace the PDE parameter tensor.
+        self.layers = nn.ModuleList([
+            Factorized_Spectral_Layer(
+                width = width,
+                fourier_modes = fourier_modes,
+                share_fourier = share_fourier,
+                ff_factor = ff_factor,
+                ff_n_layers = ff_n_layers,
+                device = device
+                ) for _ in range(n_layers)
+                ])
 
-        pde_params : str          — path to a .npy file
-                     torch.Tensor — (N, n_params) float tensor
-                     None         — no PDE parameter conditioning
+        # ── ParamMLP (PDE physics) ───────────────────────────────────────────
+        self.param_mlp = ParamMLP(
+            n_params = n_pde_params,
+            width    = width,
+            hidden   = param_mlp_hidden,
+            device   = device,
+        ) if n_pde_params > 0 else None
 
-        Note: the timestep is always returned separately by __getitem__
-        regardless of this setting. n_pde_params reflects only the physics
-        parameters; use n_pde_params=0 and use_time_mlp=True in FFNO if you
-        only want temporal conditioning.
-        """
-        if pde_params is None:
-            self.pde_params = None
-            self.n_pde_params = 0
-            return
-
-        if isinstance(pde_params, str):
-            path = pde_params
-            if path.endswith('.npy'):
-                pde_params = torch.from_numpy(np.load(path))
-            else:
-                raise ValueError(f'Unsupported file extension: {path!r}. Expected .npy')
-
-        pde_params = torch.as_tensor(pde_params, dtype=torch.float32)
-        assert pde_params.ndim == 2, 'pde_params must be 2D: (N, n_params)'
-        assert pde_params.shape[0] == self.N, (
-            f'pde_params has {pde_params.shape[0]} rows but dataset has {self.N} trajectories'
-        )
-        self.pde_params = pde_params.to(self.device)
-        self.n_pde_params = pde_params.shape[1]
-
-    def normalize_manually(self, norm_cs: dict):
-        if self.norm_mode != 'none':
-            self.normalize('none')
-        for var in self.Vars:
-            self.Vars[var]['data'] /= norm_cs[var]
-        self.norm_mode = 'manual'
-        self.manual_norm_cs = norm_cs
-
-    def normalize(self, mode: str = 'none'):
-        if mode == self.norm_mode:
-            return
-
-        if mode == 'none':
-            if self.norm_mode == 'standard':
-                for var in self.Vars.keys():
-                    self.Vars[var]['data'] *= self.Vars[var]['std']
-                    self.Vars[var]['data'] += self.Vars[var]['mean']
-            elif self.norm_mode == 'minmax':
-                for var in self.Vars.keys():
-                    self.Vars[var]['data'] *= self.Vars[var]['max'] - self.Vars[var]['min']
-                    self.Vars[var]['data'] += self.Vars[var]['min']
-            elif self.norm_mode == 'maxabs':
-                for var in self.Vars.keys():
-                    self.Vars[var]['data'] *= self.Vars[var]['maxabs']
-            elif self.norm_mode == 'meanabs':
-                for var in self.Vars.keys():
-                    self.Vars[var]['data'] *= self.Vars[var]['meanabs']
-            elif self.norm_mode == 'RMS':
-                for var in self.Vars.keys():
-                    self.Vars[var]['data'] *= self.Vars[var]['RMS']
-            elif self.norm_mode == 'manual':
-                for var in self.Vars.keys():
-                    self.Vars[var]['data'] *= self.manual_norm_cs[var]
-                self.manual_norm_cs = None
-            self.norm_mode = 'none'
-            return
-
-        if self.norm_mode != 'none':
-            self.normalize('none')
-
-        if mode == 'standard':
-            for var in self.Vars.keys():
-                self.Vars[var]['data'] -= self.Vars[var]['mean']
-                self.Vars[var]['data'] /= self.Vars[var]['std']
-        elif mode == 'minmax':
-            for var in self.Vars.keys():
-                self.Vars[var]['data'] -= self.Vars[var]['min']
-                self.Vars[var]['data'] /= self.Vars[var]['max'] - self.Vars[var]['min']
-        elif mode == 'absmax':
-            for var in self.Vars.keys():
-                self.Vars[var]['data'] /= self.Vars[var]['abs_max']
-        elif mode == 'absmean':
-            for var in self.Vars.keys():
-                self.Vars[var]['data'] /= self.Vars[var]['abs_mean']
-        elif mode == 'RMS':
-            for var in self.Vars.keys():
-                self.Vars[var]['data'] /= self.Vars[var]['RMS']
-        else:
-            raise ValueError('Invalid normalization mode')
-
-        self.norm_mode = mode
-
-    def config(
-            self,
-            subset: float = 1.0,
-            where: str = 'random',
-            reverse: bool = False,
-            seed: int = 0,
-            frac: float = 1.0,
-            frac_seed: int = 0
-    ):
-        chosen = np.full(self.N, True)
-
-        assert 0.0 <= subset <= 1.0
-        assert where in ['random', 'top', 'bottom', 'middle']
-        n_subset = round(subset * self.N)
-
-        if where == 'random':
-            np.random.seed(seed)
-            cut = np.random.permutation(self.N) <= n_subset - 1
-        elif where == 'top':
-            cut = np.arange(self.N) > (self.N - n_subset)
-        elif where == 'bottom':
-            cut = np.arange(self.N) <= n_subset
-        elif where == 'middle':
-            cut = np.arange(self.N) > (self.N // 2 - n_subset // 2) & np.arange(self.N) <= (self.N // 2 + n_subset // 2)
-
-        if reverse:
-            cut = ~cut
-
-        chosen = chosen & cut
-        chosen_indexes = np.arange(self.N)[chosen]
-
-        if frac == 1.0:
-            self.indexes = chosen_indexes
-            return self.indexes
-
-        np.random.seed(frac_seed)
-        perm = np.random.permutation(len(chosen_indexes))
-        self.indexes = chosen_indexes[perm[:round(frac * len(chosen_indexes))]]
-        return self.indexes
-
-    def save(self, path: str):
-        with h5py.File(path, 'w') as f:
-            for attr in self.Vars.keys():
-                f.create_dataset(name=attr, data=self.Vars[attr]['data'].cpu().numpy())
-            for attr in self.Coords.keys():
-                f.create_dataset(name=attr, data=self.Coords[attr]['data'].cpu().numpy())
-
-    def samples_per_traj(self) -> int:
-        return self.nt - (self.in_snapshots + self.rollout * (self.skip + self.out_snapshots) - 1) * self.dt
-
-    def get_index(self, i):
-        traj_idx = i // self.samples_per_traj()
-        t_start = i % self.samples_per_traj()
-        return traj_idx, t_start
-
-    def config_autoregression(
-            self,
-            dt: int = None,
-            in_snapshots: int = None,
-            out_snapshots: int = None,
-            rollout: int = None,
-            skip: int = None,
-    ):
-        if dt is None: dt = self.dt
-        if in_snapshots is None: in_snapshots = self.in_snapshots
-        if out_snapshots is None: out_snapshots = self.out_snapshots
-        if rollout is None: rollout = self.rollout
-        if skip is None: skip = self.skip
-
-        assert dt > 0
-        assert in_snapshots > 0
-        assert out_snapshots > 0
-        assert rollout >= 0
-        assert (in_snapshots + rollout * (skip + out_snapshots) - 1) * dt < self.nt
-        if skip > 0 and rollout > 1:
-            assert in_snapshots <= out_snapshots
-
-        self.dt = dt
-        self.in_snapshots = in_snapshots
-        self.out_snapshots = out_snapshots
-        self.rollout = rollout
-        self.skip = skip
-
-    def __len__(self):
-        return len(self.indexes) * self.samples_per_traj()
-
-    def __getitem__(self, i: int) -> list:
-        traj_idx, t_start = self.get_index(i)
-
-        sample = {var: [
-            self.Vars[var]['data'][
-                self.indexes[traj_idx],
-                t_start: t_start + self.dt * self.in_snapshots: self.dt,
-                ...]
-        ] + [
-            self.Vars[var]['data'][
-                self.indexes[traj_idx],
-                t_start + self.dt * (self.in_snapshots + (j + 1) * self.skip + j * self.out_snapshots):
-                t_start + self.dt * (self.in_snapshots + (j + 1) * self.skip + (j + 1) * self.out_snapshots):
-                self.dt,
-                ...]
-            for j in range(self.rollout)
-        ] for var in self.Vars}
-
-        sample = [{var: sample[var][j].to(self.device) for var in self.Vars} for j in range(self.rollout + 1)]
-
-        # ── PDE parameters (optional, physics constants, fixed per trajectory) ─
-        if self.pde_params is not None:
-            sample.append(self.pde_params[self.indexes[traj_idx]])   # (n_pde_params,)
-
-        # ── Normalised timestep (always appended last) ───────────────────────
-        # Normalised to [0, 1] so TimeMLP sees a consistent input range.
-        # Returned as a scalar (shape []) so the DataLoader collates it to (B,).
-        t_norm = torch.tensor(
-            t_start / max(self.nt - 1, 1),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        sample.append(t_norm)
+        # ── TimeMLP (temporal position) ──────────────────────────────────────
+        self.time_mlp = TimeMLP(
+            width  = width,
+            hidden = time_mlp_hidden,
+            device = device,
+        ) if use_time_mlp else None
         # ────────────────────────────────────────────────────────────────────
 
-        return sample
-        # Final layout:
-        #   chunk_0, ..., chunk_rollout  — field dicts
-        #   pde_params                   — (n_pde_params,)  [only if set]
-        #   t_norm                       — scalar in [0, 1] [always]
+    def forward(
+            self,
+            x          : dict,
+            pde_params : torch.FloatTensor = None,   # (B, n_pde_params)
+            t          : torch.FloatTensor = None,   # (B,) or (B, 1)
+            ):
+        """
+        x          : {var: (B, C, *spatial)}
+        pde_params : (B, n_pde_params)  required when n_pde_params > 0
+        t          : (B,) or (B, 1)     normalised to [0,1], required when use_time_mlp=True
+        """
+        x = self.projector.in_proj(x)
+
+        # ── layer 0 ──────────────────────────────────────────────────────────
+        b = self.layers[0](x)
+        x = x + b
+
+        # ── conditioning injections (after encoder layer, before the rest) ───
+        if self.param_mlp is not None:
+            if pde_params is None:
+                raise ValueError(
+                    "FFNO was built with n_pde_params > 0 but `pde_params` "
+                    "was not passed to forward()."
+                )
+            x = x + _broadcast_latent(self.param_mlp(pde_params), x)
+
+        if self.time_mlp is not None:
+            if t is None:
+                raise ValueError(
+                    "FFNO was built with use_time_mlp=True but `t` "
+                    "was not passed to forward()."
+                )
+            x = x + _broadcast_latent(self.time_mlp(t), x)
+        # ────────────────────────────────────────────────────────────────────
+
+        for layer in self.layers[1:]:
+            b = layer(x)
+            x = x + b
+
+        b = self.projector.out_proj(b)
+        return b
+    
+    def transfer_from(
+            self,
+            source_ffno : nn.Module,
+            transfer_in_vars : str = 'all',
+            transfer_in_vars_scalers : str = None, 
+            transfer_out_vars : str = 'all', 
+            transfer_out_vars_scalers : str = None, 
+            transfer_fourier_layers : str = 'all',
+            transfer_fourier_scalers : str = None,
+            transfer_ff_layers : str = 'all',
+            # ── MLP transfer flags ───────────────────────────────────────────
+            transfer_time_mlp  : bool = True,   # time encoding transfers well across PDEs
+            transfer_param_mlp : bool = False,  # PDE-specific; usually retrain from scratch
+            # ────────────────────────────────────────────────────────────────
+    ):
+        assert self.n_layers == source_ffno.n_layers, 'number of spectral layers should be the same'
+        source_ffno.to(self.device)
+        
+        self.projector.transfer_from(
+            source_projector = source_ffno.projector, 
+            transfer_in_vars = transfer_in_vars, 
+            transfer_in_vars_scalers = transfer_in_vars_scalers,
+            transfer_out_vars = transfer_out_vars,
+            transfer_out_vars_scalers = transfer_out_vars_scalers
+            )
+
+        transfer_fourier_layers = parse_csv(transfer_fourier_layers, full=range(self.n_layers), func=int)
+        transfer_fourier_scalers = parse_csv_scalers(transfer_fourier_scalers)
+        
+        if len(transfer_fourier_scalers) == 1:
+            transfer_fourier_scalers = transfer_fourier_scalers * len(transfer_fourier_layers)
+        elif len(transfer_fourier_scalers) != len(transfer_fourier_layers):
+            raise ValueError('number of scalers should be the same as number of layers')
+
+        transfer_ff_layers = parse_csv(transfer_ff_layers, full=range(self.n_layers), func=int)
+    
+        for i in range(self.n_layers):
+            self.layers[i].transfer_from(
+                source_layer = source_ffno.layers[i], 
+                fourier = i in transfer_fourier_layers,
+                scaler = transfer_fourier_scalers[transfer_fourier_layers.index(i)],
+                ff = i in transfer_ff_layers
+                )
+
+        # ── TimeMLP transfer ─────────────────────────────────────────────────
+        if transfer_time_mlp:
+            if self.time_mlp is None or source_ffno.time_mlp is None:
+                raise ValueError('Both source and target must have use_time_mlp=True to transfer TimeMLP.')
+            self.time_mlp.load_state_dict(source_ffno.time_mlp.state_dict())
+
+        # ── ParamMLP transfer ────────────────────────────────────────────────
+        if transfer_param_mlp:
+            if self.param_mlp is None or source_ffno.param_mlp is None:
+                raise ValueError('Both source and target must have n_pde_params > 0 to transfer ParamMLP.')
+            if self.n_pde_params != source_ffno.n_pde_params:
+                raise ValueError(
+                    f'n_pde_params mismatch ({self.n_pde_params} vs {source_ffno.n_pde_params}). '
+                    'Leave transfer_param_mlp=False when transferring to a different PDE.'
+                )
+            self.param_mlp.load_state_dict(source_ffno.param_mlp.state_dict())
+        # ────────────────────────────────────────────────────────────────────
+            
+    def set_trainability(
+            self,
+            in_vars : str = 'all',
+            out_vars : str = 'all',
+            fourier_layers : str = 'all',
+            ff_layers : str = 'all',
+            trainable : bool = True,
+            # ── per-MLP overrides (None = inherit from `trainable`) ──────────
+            time_mlp  : bool = None,
+            param_mlp : bool = None,
+            ):
+        """
+        Fine-grained trainability control.
+
+        Examples
+        --------
+        # Freeze everything, then unfreeze only ParamMLP (new PDE fine-tune):
+        model.set_trainability(trainable=False, param_mlp=True)
+
+        # Freeze only the TimeMLP, train everything else:
+        model.set_trainability(trainable=True, time_mlp=False)
+        """
+        self.projector.set_trainability(
+            in_vars = in_vars,
+            out_vars = out_vars,
+            trainable = trainable
+            )
+        
+        fourier_layers = parse_csv(fourier_layers, full=range(self.n_layers), func=lambda x: int(x)%self.n_layers)
+        ff_layers      = parse_csv(ff_layers,      full=range(self.n_layers), func=lambda x: int(x)%self.n_layers)
+
+        for i in range(self.n_layers):
+            self.layers[i].set_trainability(
+                fourier = i in fourier_layers,
+                ff = i in ff_layers,
+                trainable = trainable
+                )
+
+        if self.time_mlp is not None:
+            self.time_mlp.requires_grad_(trainable if time_mlp is None else time_mlp)
+
+        if self.param_mlp is not None:
+            self.param_mlp.requires_grad_(trainable if param_mlp is None else param_mlp)
