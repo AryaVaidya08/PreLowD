@@ -1,5 +1,9 @@
 """
 Author: AmirPouya Hemmasian (a.pouyahemmasian@gmail.com) (ahemmasi@andrew.cmu.edu)
+
+Modification: PDE parameter conditioning and timestep conditioning are handled
+by two separate MLPs (ParamMLP and TimeMLP) so that each can be independently
+frozen or fine-tuned during transfer learning.
 """
 from einops import rearrange
 import torch
@@ -26,18 +30,17 @@ class Linear(nn.Linear):
 class Projector(nn.Module):
     """
     A simple linear projector for input and output variables.
-    Code is simple and self-explanatory.
 
     the input/output space is a dictionary of input/output variables, each with shape (B, C, ...) where ... are spatial dimensions
     the projection space is a single tensor of shape (B, C, ...) where ... are spatial dimensions
     """
     def __init__(
             self,
-            in_vars, # iterable of strings
+            in_vars,
             in_dim : int,
             out_dim : int,
             proj_dim : int,
-            out_vars = None, # iterable of strings. If None, in_vars are used
+            out_vars = None,
             device = Device,
     ):
         self.device = device
@@ -62,28 +65,14 @@ class Projector(nn.Module):
     def transfer_from(
             self,
             source_projector : nn.Module,
-            transfer_in_vars : str = 'all', # comma separated variables to transfer from source to target.
-            transfer_in_vars_scalers : str = None, # comma separated scalers for each variable.
+            transfer_in_vars : str = 'all',
+            transfer_in_vars_scalers : str = None,
             transfer_out_vars : str = 'all',
             transfer_out_vars_scalers : str = None
             ):
-        """
-        inputs for in_vars or out_vars:
-            separate variables by comma
-            If the same variable is being transferred, use it by itself
-            if you want to transfer a variable to another variable, use '>'
-        examples:
-        u,v,w :
-            u projector of source model transfered to u projector of this model
-            v projector of source model transfered to v projector of this model
-        u,v>w:
-            u projector of source model transfered to u projector of this model
-            v projector of source model transfered to w projector of this model
-        """
         transfer_parser = lambda x: list(x.split('>')) if '>' in x else x
 
         in_vars = parse_csv(transfer_in_vars, full=self.in_vars, func=transfer_parser)
-
         in_vars_scalers = parse_csv_scalers(transfer_in_vars_scalers)
         
         if len(in_vars_scalers) == 1:
@@ -92,7 +81,6 @@ class Projector(nn.Module):
             raise ValueError('number of scalers should be the same as number of variables')
 
         out_vars = parse_csv(transfer_out_vars, full=self.out_vars, func=transfer_parser)
-
         out_vars_scalers = parse_csv_scalers(transfer_out_vars_scalers)
         
         if len(out_vars_scalers) == 1:
@@ -118,10 +106,6 @@ class Projector(nn.Module):
             out_vars : str = None,
             trainable : bool = True
             ):
-        """
-        each argument is comma separated list of variables, like : 'u,v,w'
-        If you do not want to touch any variable, pass an empty string like ''
-        """
         in_vars = parse_csv(in_vars, full=self.in_vars)
         for var in in_vars:
             self.in_projector[var].requires_grad_(trainable)
@@ -162,21 +146,19 @@ class FeedForward(nn.Module):
 
 class ParamMLP(nn.Module):
     """
-    A small 2-layer MLP that encodes a flat PDE parameter vector into a
-    latent representation of size `width`.
+    Encodes PDE scalar parameters (viscosity, Re, etc.) → latent (B, width).
 
-    Input:  pde_params  shape (B, n_params)          – scalar PDE parameters
-                                                        (e.g. viscosity, Re, …)
-    Output: latent      shape (B, width)
+    These are physical constants fixed per trajectory. Kept separate from
+    TimeMLP so it can be frozen/replaced independently during transfer learning.
 
-    The latent is later broadcast over the spatial dimensions and added to the
-    field tensor produced by the first FFNO encoder layer.
+    Input:  pde_params  (B, n_params)
+    Output:             (B, width)
     """
     def __init__(
             self,
-            n_params : int,   # number of scalar PDE parameters
-            width    : int,   # must match FFNO width
-            hidden   : int = None,  # hidden dim; defaults to 2*width
+            n_params : int,
+            width    : int,
+            hidden   : int = None,
             device = Device,
             ):
         super().__init__()
@@ -189,30 +171,54 @@ class ParamMLP(nn.Module):
         )
 
     def forward(self, pde_params: torch.FloatTensor) -> torch.FloatTensor:
-        """
-        pde_params : (B, n_params)
-        returns     : (B, width)
-        """
         return self.mlp(pde_params)
+
+
+class TimeMLP(nn.Module):
+    """
+    Encodes the normalised timestep t ∈ [0, 1] → latent (B, width).
+
+    Kept separate from ParamMLP because the timestep is a dynamic positional
+    signal (changes every sample) while PDE params are fixed per trajectory.
+    Separation lets you freeze this during transfer to a new PDE while only
+    retraining ParamMLP, or vice-versa.
+
+    Input:  t  (B,) or (B, 1)   normalised to [0, 1]
+    Output:    (B, width)
+    """
+    def __init__(
+            self,
+            width  : int,
+            hidden : int = None,
+            device = Device,
+            ):
+        super().__init__()
+        self.device = device
+        hidden = hidden or 2 * width
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden, device=device),
+            nn.ReLU(),
+            nn.Linear(hidden, width, device=device),
+        )
+
+    def forward(self, t: torch.FloatTensor) -> torch.FloatTensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)   # (B,) → (B, 1)
+        return self.mlp(t)
 
 
 def _broadcast_latent(latent: torch.FloatTensor, field: torch.FloatTensor) -> torch.FloatTensor:
     """
-    Expand a (B, C) latent vector to match the spatial shape of `field`
-    which has shape (B, C, *spatial_dims), then return it so it can be
-    added elementwise.
-
-    e.g.  field (B, C, Nx, Ny)  →  latent expanded to (B, C, 1, 1) → broadcast
+    Expand a (B, C) latent to match the spatial shape of `field` (B, C, *spatial).
     """
-    n_spatial = field.ndim - 2          # number of spatial axes
-    latent = latent.view(*latent.shape, *([1] * n_spatial))   # (B, C, 1, …, 1)
+    n_spatial = field.ndim - 2
+    latent = latent.view(*latent.shape, *([1] * n_spatial))
     return latent.expand_as(field)
 
 
 class Factorized_Spectral_Layer(nn.Module):
     """
-    This is a general Factorized Spectral Convolution Layer for either 1D, 2D, or 3D spatial data.
-    The number of spatial dimensions is implied by the length of fourier_modes.
+    General Factorized Spectral Convolution Layer for 1D, 2D, or 3D spatial data.
 
     Base code taken from:
     https://github.com/alasdairtran/fourierflow/blob/main/fourierflow/modules/factorized_fno/mesh_2d.py
@@ -220,7 +226,7 @@ class Factorized_Spectral_Layer(nn.Module):
     def __init__(
             self, 
             width: int,
-            fourier_modes, # iterable of integers
+            fourier_modes,
             share_fourier = False,
             ff_factor = 2,
             ff_n_layers = 2,
@@ -237,9 +243,6 @@ class Factorized_Spectral_Layer(nn.Module):
             share_fourier = True
         self.share_fourier = share_fourier
 
-        # this was there in the base code, so I'm leaving it here:
-        # Can't use complex type yet. See https://github.com/pytorch/pytorch/issues/59998
-   
         self.fourier_weight = nn.ParameterList()
         for i in range(self.n_spatial_dims):
             n_modes = fourier_modes[i]
@@ -264,10 +267,8 @@ class Factorized_Spectral_Layer(nn.Module):
             torch.view_as_complex(weight)
             )
     
-    def forward_fourier_dim(self, x, dim): # dim is the spatial axis (0 is x, 1 is y, 2 is z)
-
-        i = dim + 2 # skipping batch and time/feature/channel
-        # i is the tensor dimension corresponding to the spatial dimension dim
+    def forward_fourier_dim(self, x, dim):
+        i = dim + 2
         n_modes = self.fourier_modes[dim]
         shape = x.shape
 
@@ -307,13 +308,9 @@ class Factorized_Spectral_Layer(nn.Module):
         if scaler is None: scaler = 1.0
 
         if fourier:
-            # len(fourier_weight) for wach model is either 1 (1D or shared) or n_spatial_dims (different for each dim)
-            # cannot transfer if source has multiple and self has ones
             assert len(source_layer.fourier_weight) in [1, len(self.fourier_weight)], 'number of source fourier weights should be the same or 1'
-
             for i in range(len(self.fourier_weight)):
                 j = 0 if len(source_layer.fourier_weight) == 1 else i
-
                 self.fourier_weight[i].data = source_layer.fourier_weight[j].data * scaler
 
         if ff:
@@ -336,42 +333,56 @@ class FFNO(nn.Module):
     Base code taken from:
     https://github.com/alasdairtran/fourierflow/blob/main/fourierflow/modules/factorized_fno/mesh_2d.py
 
-    This is a general FFNO for either 1D, 2D, or 3D spatial data.
-    The number of spatial dimensions is determined by the length of fourier_modes.
+    General FFNO for 1D, 2D, or 3D spatial data.
 
-    PDE-parameter conditioning
-    --------------------------
-    When `n_pde_params > 0` a small 2-layer MLP (`ParamMLP`) maps the flat
-    PDE parameter vector (B, n_pde_params) → (B, width).  The resulting
-    latent is broadcast to match the spatial shape of the field and added
-    to the hidden state **after the first encoder (spectral) layer**, letting
-    the network condition every subsequent layer on the PDE parameters.
+    Conditioning
+    ------------
+    Two independent MLPs inject information after the first encoder layer:
+
+      ParamMLP  — physical PDE parameters (viscosity, Re, …), fixed per trajectory
+                  enable with n_pde_params > 0
+      TimeMLP   — normalised timestep t ∈ [0, 1], varies per sample
+                  enable with use_time_mlp=True  (default)
+
+    Both latents are broadcast over spatial dims and summed into the hidden state:
+
+        x += broadcast( param_mlp(pde_params) )   # if enabled
+        x += broadcast( time_mlp(t) )             # if enabled
+
+    Transfer learning
+    -----------------
+    New PDE, same time domain:
+        model.set_trainability(trainable=False, time_mlp=False, param_mlp=True)
+        # also call transfer_from(..., transfer_param_mlp=False, transfer_time_mlp=True)
+
+    Same PDE, different time window:
+        model.set_trainability(trainable=False, param_mlp=False, time_mlp=True)
 
     Usage
     -----
-    # pde_params is a (B, n_pde_params) float tensor, or None
-    output = model(x, pde_params=pde_params)
+    # Dataset produces t separately from pde_params now — see dataset_pde.py
+    *chunks, pde_params, t = batch
+    output = model(chunks[0], pde_params=pde_params, t=t)
     """
     def __init__(
             self,
-            in_vars, # iterable of strings
-            out_vars, # iterable of strings
+            in_vars,
+            out_vars,
             in_dim : int, 
             out_dim : int,
-
             n_layers: int,
             width: int,
             fourier_modes: tuple,
             share_fourier = False,
-
             ff_n_layers = 2,
             ff_factor = 2,
-
-            # ── PDE parameter conditioning ──────────────────────────────────
-            n_pde_params : int = 0,      # set > 0 to enable conditioning
-            param_mlp_hidden : int = None,  # hidden dim of ParamMLP (default 2*width)
+            # ── PDE parameter conditioning ───────────────────────────────────
+            n_pde_params : int = 0,         # 0 = disabled
+            param_mlp_hidden : int = None,  # hidden dim, default 2*width
+            # ── Timestep conditioning ────────────────────────────────────────
+            use_time_mlp : bool = True,     # False = disabled
+            time_mlp_hidden : int = None,   # hidden dim, default 2*width
             # ────────────────────────────────────────────────────────────────
-
             device = Device
             ):
         super().__init__()
@@ -382,6 +393,7 @@ class FFNO(nn.Module):
         self.fourier_modes = fourier_modes
         self.device = device
         self.n_pde_params = n_pde_params
+        self.use_time_mlp = use_time_mlp
 
         self.projector = Projector(
             in_vars = in_vars,
@@ -404,55 +416,57 @@ class FFNO(nn.Module):
                 ) for _ in range(n_layers)
                 ])
 
-        # ── PDE parameter MLP (optional) ────────────────────────────────────
-        # Instantiated only when the caller requests PDE conditioning.
-        # The MLP output (B, width) is broadcast over spatial dims and added
-        # to the field tensor right after the first spectral layer.
-        if n_pde_params > 0:
-            self.param_mlp = ParamMLP(
-                n_params = n_pde_params,
-                width    = width,
-                hidden   = param_mlp_hidden,
-                device   = device,
-            )
-        else:
-            self.param_mlp = None
+        # ── ParamMLP (PDE physics) ───────────────────────────────────────────
+        self.param_mlp = ParamMLP(
+            n_params = n_pde_params,
+            width    = width,
+            hidden   = param_mlp_hidden,
+            device   = device,
+        ) if n_pde_params > 0 else None
+
+        # ── TimeMLP (temporal position) ──────────────────────────────────────
+        self.time_mlp = TimeMLP(
+            width  = width,
+            hidden = time_mlp_hidden,
+            device = device,
+        ) if use_time_mlp else None
         # ────────────────────────────────────────────────────────────────────
 
-    def forward(self, x: dict, pde_params: torch.FloatTensor = None):
+    def forward(
+            self,
+            x          : dict,
+            pde_params : torch.FloatTensor = None,   # (B, n_pde_params)
+            t          : torch.FloatTensor = None,   # (B,) or (B, 1)
+            ):
         """
-        x          : dict of field tensors  {var: (B, C, *spatial)}
-        pde_params : (B, n_pde_params) float tensor, or None
-
-        Forward pass
-        ────────────
-        1. in_proj  : project input dict → (B, width, *spatial)
-        2. layer[0] : first spectral layer  (the "encoder" layer)
-        3. [optional] compute param latent via ParamMLP and add to hidden state
-        4. layer[1..] : remaining spectral layers
-        5. out_proj : project back to output dict
+        x          : {var: (B, C, *spatial)}
+        pde_params : (B, n_pde_params)  required when n_pde_params > 0
+        t          : (B,) or (B, 1)     normalised to [0,1], required when use_time_mlp=True
         """
-        x = self.projector.in_proj(x)                      # (B, width, *spatial)
+        x = self.projector.in_proj(x)
 
-        # ── layer 0  (first / encoder layer) ────────────────────────────────
+        # ── layer 0 ──────────────────────────────────────────────────────────
         b = self.layers[0](x)
         x = x + b
 
-        # ── PDE parameter injection ──────────────────────────────────────────
-        # After the first encoder layer we mix in the PDE parameter latent.
-        # The latent is (B, width); we broadcast it over spatial dims so that
-        # every grid point receives the same parameter information.
+        # ── conditioning injections (after encoder layer, before the rest) ───
         if self.param_mlp is not None:
             if pde_params is None:
                 raise ValueError(
                     "FFNO was built with n_pde_params > 0 but `pde_params` "
                     "was not passed to forward()."
                 )
-            param_latent = self.param_mlp(pde_params)          # (B, width)
-            x = x + _broadcast_latent(param_latent, x)        # (B, width, *spatial)
+            x = x + _broadcast_latent(self.param_mlp(pde_params), x)
+
+        if self.time_mlp is not None:
+            if t is None:
+                raise ValueError(
+                    "FFNO was built with use_time_mlp=True but `t` "
+                    "was not passed to forward()."
+                )
+            x = x + _broadcast_latent(self.time_mlp(t), x)
         # ────────────────────────────────────────────────────────────────────
 
-        # ── remaining layers ─────────────────────────────────────────────────
         for layer in self.layers[1:]:
             b = layer(x)
             x = x + b
@@ -462,16 +476,18 @@ class FFNO(nn.Module):
     
     def transfer_from(
             self,
-            source_ffno : nn.Module,     
-
+            source_ffno : nn.Module,
             transfer_in_vars : str = 'all',
             transfer_in_vars_scalers : str = None, 
             transfer_out_vars : str = 'all', 
             transfer_out_vars_scalers : str = None, 
-
             transfer_fourier_layers : str = 'all',
             transfer_fourier_scalers : str = None,
             transfer_ff_layers : str = 'all',
+            # ── MLP transfer flags ───────────────────────────────────────────
+            transfer_time_mlp  : bool = True,   # time encoding transfers well across PDEs
+            transfer_param_mlp : bool = False,  # PDE-specific; usually retrain from scratch
+            # ────────────────────────────────────────────────────────────────
     ):
         assert self.n_layers == source_ffno.n_layers, 'number of spectral layers should be the same'
         source_ffno.to(self.device)
@@ -485,12 +501,10 @@ class FFNO(nn.Module):
             )
 
         transfer_fourier_layers = parse_csv(transfer_fourier_layers, full=range(self.n_layers), func=int)
-        
         transfer_fourier_scalers = parse_csv_scalers(transfer_fourier_scalers)
         
         if len(transfer_fourier_scalers) == 1:
             transfer_fourier_scalers = transfer_fourier_scalers * len(transfer_fourier_layers)
-
         elif len(transfer_fourier_scalers) != len(transfer_fourier_layers):
             raise ValueError('number of scalers should be the same as number of layers')
 
@@ -503,16 +517,47 @@ class FFNO(nn.Module):
                 scaler = transfer_fourier_scalers[transfer_fourier_layers.index(i)],
                 ff = i in transfer_ff_layers
                 )
+
+        # ── TimeMLP transfer ─────────────────────────────────────────────────
+        if transfer_time_mlp:
+            if self.time_mlp is None or source_ffno.time_mlp is None:
+                raise ValueError('Both source and target must have use_time_mlp=True to transfer TimeMLP.')
+            self.time_mlp.load_state_dict(source_ffno.time_mlp.state_dict())
+
+        # ── ParamMLP transfer ────────────────────────────────────────────────
+        if transfer_param_mlp:
+            if self.param_mlp is None or source_ffno.param_mlp is None:
+                raise ValueError('Both source and target must have n_pde_params > 0 to transfer ParamMLP.')
+            if self.n_pde_params != source_ffno.n_pde_params:
+                raise ValueError(
+                    f'n_pde_params mismatch ({self.n_pde_params} vs {source_ffno.n_pde_params}). '
+                    'Leave transfer_param_mlp=False when transferring to a different PDE.'
+                )
+            self.param_mlp.load_state_dict(source_ffno.param_mlp.state_dict())
+        # ────────────────────────────────────────────────────────────────────
             
     def set_trainability(
             self,
-            in_vars : str = 'all', # comma separated variables to set trainability.
-            out_vars : str = 'all', # comma separated variables to set trainability.
-            fourier_layers : str = 'all', # comma separated layers to set trainability.
-            ff_layers : str = 'all', # comma separated layers to set trainability.
-            trainable : bool = True # whether to set trainable or not
+            in_vars : str = 'all',
+            out_vars : str = 'all',
+            fourier_layers : str = 'all',
+            ff_layers : str = 'all',
+            trainable : bool = True,
+            # ── per-MLP overrides (None = inherit from `trainable`) ──────────
+            time_mlp  : bool = None,
+            param_mlp : bool = None,
             ):
-        
+        """
+        Fine-grained trainability control.
+
+        Examples
+        --------
+        # Freeze everything, then unfreeze only ParamMLP (new PDE fine-tune):
+        model.set_trainability(trainable=False, param_mlp=True)
+
+        # Freeze only the TimeMLP, train everything else:
+        model.set_trainability(trainable=True, time_mlp=False)
+        """
         self.projector.set_trainability(
             in_vars = in_vars,
             out_vars = out_vars,
@@ -520,7 +565,7 @@ class FFNO(nn.Module):
             )
         
         fourier_layers = parse_csv(fourier_layers, full=range(self.n_layers), func=lambda x: int(x)%self.n_layers)
-        ff_layers = parse_csv(ff_layers, full=range(self.n_layers), func=lambda x: int(x)%self.n_layers)
+        ff_layers      = parse_csv(ff_layers,      full=range(self.n_layers), func=lambda x: int(x)%self.n_layers)
 
         for i in range(self.n_layers):
             self.layers[i].set_trainability(
@@ -528,3 +573,9 @@ class FFNO(nn.Module):
                 ff = i in ff_layers,
                 trainable = trainable
                 )
+
+        if self.time_mlp is not None:
+            self.time_mlp.requires_grad_(trainable if time_mlp is None else time_mlp)
+
+        if self.param_mlp is not None:
+            self.param_mlp.requires_grad_(trainable if param_mlp is None else param_mlp)
