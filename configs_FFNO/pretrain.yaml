@@ -20,9 +20,7 @@ share_fourier:
 rollout:
 - 1
 seed:
-- 0
-- 1
-- 2
+- 4
 iters:
 - 5000
 batch_size:
