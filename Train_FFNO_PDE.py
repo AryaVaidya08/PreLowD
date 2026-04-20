@@ -350,13 +350,16 @@ def train_and_save_result(
         share_fourier = args.share_fourier,
 
         n_pde_params = 3,
-        param_mlp_hidden = 2 * 160,
+        param_mlp_hidden = 2 * args.ffno_width,
 
         use_time_mlp = True,
-        time_mlp_hidden = 2 * 160,
+        time_mlp_hidden = 2 * args.ffno_width,
         
         device = Device
         )
+
+    print("Trainable Params:", sum(p.numel() for p in ffno.parameters() if p.requires_grad)
+)
 
     print(pretrained_ffno_path)
 
