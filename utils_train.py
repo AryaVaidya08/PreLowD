@@ -87,7 +87,7 @@ def forward_pass_loss(
         ):
 
     #USED FOR PDE -------------------- CHANGE IF DNE        
-    *xs, pde_p, timesteps = xs
+    *xs, pde_p, t_start = xs
     rollout = len(xs) - 1
 
 
@@ -109,7 +109,8 @@ def forward_pass_loss(
         model_input = xs[0]
         losses = []
         for r in range(1, rollout+1):
-            model_output = model(model_input, pde_params=pde_p, t=timesteps)
+            new_timestep = torch.tensor(t_start + (r * (1.0/43.0)))
+            model_output = model(model_input, pde_params=pde_p, t=new_timestep)
             loss = loss_fn(model_output, xs[r], reduction=loss_reduction)
             losses.append(loss)
             if rollout == 1: break # to avoid unnecessary errors for simple input to output tasks
