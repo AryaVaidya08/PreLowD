@@ -13,9 +13,10 @@ from torch import optim
 from config_parser import parse_args, save_config
 from Datasets_PDE import PDEDataset
 from utils_train import set_seed, parse_csv, Relative_Lp_Loss, train_iters
-from Models_PDE import FFNO, Projector, Linear, FeedForward, Factorized_Spectral_Layer
+from Models_PDE import FFNO, Projector, Linear, FeedForward, Factorized_Spectral_Layer, ParamMLP, TimeMLP
 from plotting import plot_experiments, plot_training, model_namer, transfer_namer
 
+torch.serialization.add_safe_globals([ParamMLP, TimeMLP, torch.nn.modules.linear.Linear])
 
 os.makedirs('./results', exist_ok=True)
 Device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -298,7 +299,10 @@ def find_matching_pretrained_ffno(
         pretrained_ffno_dir,
         model_args
         ):
-    pretrained_dir_result_table = pd.read_excel("/"+pretrained_ffno_dir+'/table.xlsx')
+
+    print(pretrained_ffno_dir)
+    pretrained_dir_result_table = pd.read_excel(pretrained_ffno_dir+'/table.xlsx')
+    
     # find a row that its columns matches the content of the dict of vars(model_args)
 
     matching_args = {
@@ -320,7 +324,9 @@ def find_matching_pretrained_ffno(
     ]
     if len(matching_row) == 0:
         raise ValueError('No matching pretrained model found!')
-    return '/content/1d_results/models/model_00000.pt'
+
+    print(pretrained_ffno_dir)
+    return pretrained_ffno_dir+'/models/model_00000.pt'
 
 
 def train_and_save_result(
@@ -527,7 +533,7 @@ def main():
     model_args_pbar = tqdm(all_model_args, leave=True)
     for model_args in model_args_pbar:
         model_args_pbar.set_description('model | ' + descriptor(model_args, varying_model_params)+' ')
-        
+        """
         # training without transfer learning:
         result_table, idx, ffno = train_and_save_result(
             args = model_args,
@@ -542,7 +548,7 @@ def main():
 
             log_plots = False
             )
-
+        """
         if not main_args.transfer_from:
             continue
 
@@ -560,7 +566,7 @@ def main():
         for transfer_comb in transfer_combs:
             transfer_args = deepcopy(model_args)
             vars(transfer_args).update(transfer_comb)
-            if is_valid_transfer(transfer_args, ffno):
+            if True:
                 all_transfer_args.append(transfer_args)
                 for k, v in transfer_comb.items():
                     if k not in varying_transfer_params:
