@@ -43,6 +43,14 @@ data_train_rx:
   help: loading spatial resolution of the train data
   default: null
 
+pde_train:
+  type: str
+  default: null
+
+pde_val:
+  type: str
+  default: null
+
 # validation dataset 
 # Can be the same as the training data
 
